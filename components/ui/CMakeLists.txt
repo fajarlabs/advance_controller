@@ -1,0 +1,44 @@
+idf_component_register(
+    SRCS
+        screens/ui_Screen1.c
+        screens/ui_Screen2.c
+        screens/ui_Screen4.c
+        screens/ui_Screen6.c
+        screens/ui_Screen7.c
+        screens/ui_Screen8.c
+        screens/ui_Screen9.c
+        ui.c
+        usr_k2_lan.c
+        my_global_lib.c
+        my_wifi.c
+        safe_page.c
+        nvs_helper.c
+        components/ui_comp_hook.c
+        ui_helpers.c
+        ui_events.c
+        images/ui_img_img1_png.c
+        images/ui_img_img2_png.c
+        images/ui_img_img4_png.c
+        images/ui_img_img3_png.c
+        images/ui_img_4_png.c
+        images/ui_img_5_png.c
+        images/ui_img_background_moderen_png.c
+        images/ui_img_menerima_semua_payment_yang_dapat_menggunakan_qris_png.c
+        images/ui_img_wifi_cross_png.c
+        images/ui_img_1944009510.c
+
+    INCLUDE_DIRS
+        "."
+        "screens"
+        "images"
+        "components"
+
+    REQUIRES
+        driver
+        lvgl
+        esp_wifi
+        nvs_flash
+        esp_netif
+        esp_event
+        esp_http_client
+)

@@ -1,0 +1,13 @@
+# Semua shell script harus pakai LF
+*.sh text eol=lf
+
+# Semua file source code juga pakai LF
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.py text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+
+# Optional: abaikan binary atau output
+/build/** binary

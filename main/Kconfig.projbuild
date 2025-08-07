@@ -1,0 +1,58 @@
+menu "Controller Configuration"
+
+    choice MCU_LCD_CONTROLLER
+        prompt "LCD controller model"
+        default MCU_LCD_CONTROLLER_ILI9341
+        help
+            Select LCD controller model
+
+        config MCU_LCD_CONTROLLER_ILI9341
+            bool "ILI9341"
+
+        config MCU_LCD_CONTROLLER_GC9A01
+            bool "GC9A01"
+    endchoice
+
+    config MCU_LCD_TOUCH_ENABLED
+        bool "Enable LCD touch"
+        default n
+        help
+            Enable this option if you wish to use display touch. You can select from touch controllers.
+
+    choice MCU_LCD_TOUCH_CONTROLLER
+        prompt "LCD touch controller model"
+        depends on MCU_LCD_TOUCH_ENABLED
+        default MCU_LCD_TOUCH_CONTROLLER_STMPE610
+        help
+            Select LCD touch controller model
+
+        config MCU_LCD_TOUCH_CONTROLLER_STMPE610
+            bool "STMPE610"
+            help
+                Touch controller STMPE610 connected via SPI.
+
+        config MCU_LCD_TOUCH_CONTROLLER_XPT2046
+            bool "XPT2046"
+            help
+                Touch controller XPT2046 connected via SPI.
+    endchoice
+
+    config MCU_LCD_MIRROR_Y
+        int "Set default LCD Mirror Y"
+        default 1
+        help
+            This value is 1 if XPT2046 touch controller is selected, 0 otherwise.
+
+    config MCU_DEVICEID
+        string "Set device ID"
+        default "22744ed1-84d4-4252"
+        help
+            This value is 22744ed1-84d4-4252 if device id not set.
+
+    config MCU_SERVER_HOST
+        string "Set server host"
+        default "101.255.117.178"
+        help
+            This value is 101.255.117.178 if device id not set.
+
+endmenu
