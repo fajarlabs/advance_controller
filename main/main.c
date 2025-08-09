@@ -12,6 +12,7 @@
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "lvgl.h"
 #include "../ui/ui.h"
 #include "../ui/safe_page.h"
@@ -176,11 +177,13 @@ static void example_lvgl_port_task(void *arg)
 
 void gpio_init_custom();
 static void my_gpio_isr_handler(void *arg);
-void gpio_task_example(void *arg);
 void uart_response(void *arg);
 char *extract_between_std(const char *input);
 void pulseOutputTask();
 void save_info_task(void *pvParameters);
+
+// Fungsi helper untuk update UI secara thread-safe
+void update_remain_time_label(void *data);
 
 #define GPIO_INPUT_PIN 34  // GPIO pin for pulse input pulse
 #define GPIO_OUTPUT_PIN 26 // GPIO pin for pulse input pulse
@@ -189,7 +192,6 @@ void save_info_task(void *pvParameters);
 #define PULSE_TIMEOUT_MS 500
 #define BILL_ACCEPTOR_GPIO GPIO_NUM_4
 
-static QueueHandle_t gpio_evt_queue = NULL;
 static volatile int pulseCount = 0;
 static volatile int timeoutInSecond = 0;
 static volatile int isPreviewShow = 0;
@@ -202,11 +204,12 @@ void save_info_task(void *pvParameters)
     // Use static buffer to reduce stack usage - increased size for safety
     static char query_add_transaction[160];
     int written = snprintf(query_add_transaction, sizeof(query_add_transaction),
-             "<ADDTRANSACTION,%s,%s,%d>",
-             params->device_id, params->unit_sn, params->gross_price);
-    
+                           "<ADDTRANSACTION,%s,%s,%d>",
+                           params->device_id, params->unit_sn, params->gross_price);
+
     // Check for buffer overflow
-    if (written >= sizeof(query_add_transaction)) {
+    if (written >= sizeof(query_add_transaction))
+    {
         DEBUG_PRINTLN("ERROR: Transaction query truncated!");
         free(params);
         vTaskDelete(NULL);
@@ -232,13 +235,13 @@ void save_info_task(void *pvParameters)
 
     // Free allocated memory to prevent memory leak
     free(params);
-    
-    // Check remaining stack before task deletion (only if DEBUG_MODE enabled)
-    #if DEBUG_MODE
+
+// Check remaining stack before task deletion (only if DEBUG_MODE enabled)
+#if DEBUG_MODE
     UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
     DEBUG_PRINTLN("save_info_task stack remaining: %u bytes", (unsigned int)uxHighWaterMark);
-    #endif
-    
+#endif
+
     vTaskDelete(NULL);
 }
 
@@ -261,24 +264,20 @@ void pulse_timeout_callback(TimerHandle_t xTimer)
     if (load_nvs_i32("storage", "RateConversion", &valueRateConversion) != ESP_OK)
         valueRateConversion = 0;
 
-    // ESP_LOGI(TAG, "Pulse sequence complete. Total pulses: %d", pulseCount / 2);
-    int realPulse = pulseCount / 2;
+    // ESP_LOGI(TAG, "Pulse sequence complete. Total pulses: %d", pulseCount);
+    int realPulse = pulseCount;
     int totalMoneyPulse = valueRateConversion * realPulse;
 
-    char bufferTotalMoney[16];
-    snprintf(bufferTotalMoney, sizeof(bufferTotalMoney), "%d", totalMoneyPulse);
-    lv_label_set_text(ui_Label11, bufferTotalMoney);
+    int validUnits = totalMoneyPulse / valueMoney;
+    int sisa = totalMoneyPulse % valueMoney; // sisa pembagian
 
-    if (totalMoneyPulse >= valueMoney)
+    if (validUnits > 0) // Ada minimal 1 unit uang valid
     {
-        PAYMENT_ROUTE.PaymentType = 1;
+        // Proses bagian uang yang valid (kelipatan 10000)
+        int decreasePulse = (validUnits * valueMoney) / valueRateConversion;
+        pulseCount -= decreasePulse;
 
-        int decreasePulse = (valueMoney / valueRateConversion) * 2;
-        pulseCount = pulseCount - decreasePulse;
-
-        int resultMoneyCheck = totalMoneyPulse / valueMoney;
-
-        for (int i = 0; i < (valuePulse * resultMoneyCheck); i++)
+        for (int i = 0; i < (valuePulse * validUnits); i++)
         {
             gpio_set_level(GPIO_OUTPUT_PIN, 1);
             vTaskDelay(pdMS_TO_TICKS(valueDuty));
@@ -286,19 +285,21 @@ void pulse_timeout_callback(TimerHandle_t xTimer)
             vTaskDelay(pdMS_TO_TICKS(valueDuration));
         }
 
+        // Simpan statsPulse
         int32_t valueStatsHistory;
         if (load_nvs_i32("storage", "statsPulse", &valueStatsHistory) != ESP_OK)
             valueStatsHistory = 0;
-        int32_t newvalueStatsHistory = valueStatsHistory + valuePulse;
+        int32_t newvalueStatsHistory = valueStatsHistory + (valuePulse * validUnits);
         if (newvalueStatsHistory > 9999)
             save_nvs_i32("storage", "statsPulse", 0);
         else
             save_nvs_i32("storage", "statsPulse", newvalueStatsHistory);
 
+        // Simpan statsMoney
         int32_t valueMoneyHistory;
         if (load_nvs_i32("storage", "statsMoney", &valueMoneyHistory) != ESP_OK)
             valueMoneyHistory = 0;
-        int32_t newvalueMoneyHistory = valueMoneyHistory + totalMoneyPulse;
+        int32_t newvalueMoneyHistory = valueMoneyHistory + (validUnits * valueMoney);
         if (newvalueMoneyHistory > 5000000)
         {
             newvalueMoneyHistory = newvalueMoneyHistory - valueMoneyHistory;
@@ -312,67 +313,93 @@ void pulse_timeout_callback(TimerHandle_t xTimer)
         transaction_params_t *params = malloc(sizeof(transaction_params_t));
         strcpy(params->device_id, CONFIG_MCU_DEVICEID);
         strcpy(params->unit_sn, DEVICE_INFO.UnitSn);
-        params->gross_price = totalMoneyPulse;
+        params->gross_price = validUnits * valueMoney;
         xTaskCreate(&save_info_task, "save_info_task", 8192, params, 5, NULL);
 
         gpio_set_level(GPIO_OUTPUT_PIN, 0);
-        lv_async_call(go_page6, NULL);
 
-        pulseCount = 0;
-        timeoutInSecond = 0;
-        isPreviewShow = 0;
+        // Kalau ada sisa, tampilkan di label preview
+        if (sisa > 0)
+        {
+            char bufferSisa[16];
+            snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
+            lv_label_set_text(ui_Label11, bufferSisa);
+        } else {
+            // pindah ke halaman sukses
+            lv_async_call(go_page6, NULL);
+            // Reset timeout dan preview
+            timeoutInSecond = 0;
+            isPreviewShow = 0;
+            pulseCount = 0; // Reset pulse count
+        }
+    }
+    else
+    {
+        // Tidak ada uang valid sama sekali, langsung tampilkan total
+        char bufferTotalMoney[16];
+        snprintf(bufferTotalMoney, sizeof(bufferTotalMoney), "%d", totalMoneyPulse);
+        lv_label_set_text(ui_Label11, bufferTotalMoney);
     }
 }
 
 static void IRAM_ATTR my_gpio_isr_handler(void *arg)
 {
-    uint32_t gpio_num = (uint32_t)arg;
+    // Unused parameter - suppressed to avoid compiler warning
+    (void)arg;
+
+    // Tambah counter pulsa (variabel volatile untuk keamanan thread)
+    // Menghitung setiap transisi edge yang terdeteksi oleh bill acceptor
     pulseCount++;
 
+    // Variabel untuk melacak apakah ada task prioritas tinggi yang terbangun oleh operasi ISR
+    // Digunakan untuk switching konteks FreeRTOS yang tepat dari konteks interrupt
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(gpio_evt_queue, &gpio_num, &xHigherPriorityTaskWoken);
 
+    // Reset timer timeout pulsa untuk memulai ulang perhitungan mundur
+    // Ini memperpanjang jendela pembayaran setiap kali pulsa baru terdeteksi
+    // Timer akan expired setelah PULSE_TIMEOUT_MS jika tidak ada pulsa lagi
     xTimerResetFromISR(pulse_timer, &xHigherPriorityTaskWoken);
 
+    // Jika operasi ISR membangunkan task prioritas tinggi,
+    // serahkan kontrol ke task tersebut segera setelah keluar dari ISR
+    // Ini memastikan perilaku real-time yang tepat dan penjadwalan task
     if (xHigherPriorityTaskWoken)
         portYIELD_FROM_ISR();
 }
 
-static int countPoulse = 0;
-
-void gpio_task_example(void *arg)
-{
-    uint32_t io_num;
-    for (;;)
-    {
-        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY))
-        {
-            countPoulse++;
-        }
-    }
-}
-
+// Fungsi untuk inisialisasi GPIO custom untuk sistem pembayaran
 void gpio_init_custom()
 {
-    /* Input for Bill acceptopr */
+    /* Konfigurasi Input untuk Bill Acceptor (Penerima Uang Kertas) */
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_ANYEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << GPIO_INPUT_PIN),
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE};
+        .intr_type = GPIO_INTR_POSEDGE,           // Interrupt hanya pada rising edge (LOW ke HIGH) - menghindari double count
+        .mode = GPIO_MODE_INPUT,                  // Mode input untuk menerima sinyal
+        .pin_bit_mask = (1ULL << GPIO_INPUT_PIN), // Pin yang akan digunakan (GPIO 34)
+        .pull_up_en = GPIO_PULLUP_DISABLE,        // Disable pull-up internal
+        .pull_down_en = GPIO_PULLDOWN_DISABLE};   // Disable pull-down internal
+
+    // Terapkan konfigurasi GPIO
     gpio_config(&io_conf);
+
+    // Install service interrupt GPIO dengan flag default
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+
+    // Tambahkan handler interrupt untuk pin GPIO_INPUT_PIN
+    // Setiap kali ada perubahan pada pin ini, my_gpio_isr_handler akan dipanggil
     gpio_isr_handler_add(GPIO_INPUT_PIN, my_gpio_isr_handler, (void *)GPIO_INPUT_PIN);
+
+    // DEBUG: Log bahwa GPIO interrupt sudah diinisialisasi
     // ESP_LOGI(TAG, "GPIO Interrupt initialized on GPIO%d", (int)GPIO_INPUT_PIN);
 
-    /* Output for relay coin */
+    /* Konfigurasi Output untuk Relay Coin (Output Koin) */
     gpio_config_t io_conf_out = {
-        .pin_bit_mask = (1ULL << GPIO_OUTPUT_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE};
+        .pin_bit_mask = (1ULL << GPIO_OUTPUT_PIN), // Pin output (GPIO 26)
+        .mode = GPIO_MODE_OUTPUT,                  // Mode output untuk mengirim sinyal
+        .pull_up_en = GPIO_PULLUP_DISABLE,         // Disable pull-up
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,     // Disable pull-down
+        .intr_type = GPIO_INTR_DISABLE};           // Tidak perlu interrupt untuk output
+
+    // Terapkan konfigurasi GPIO output
     gpio_config(&io_conf_out);
 
     // while (1) {
@@ -421,21 +448,37 @@ void uart_response(void *arg)
                             else if (first_token == 10002)
                                 load_nvs_data();
                             else if (first_token == 10003)
+                            {
+                                // Untuk development
                                 printf("<s>10003,%s<e>\n", CONFIG_MCU_DEVICEID);
+
+                                // Untuk production, gunakan ID unik
+                                // Berdasarkan MAC address atau chip ID
+                                // Generate unique device ID based on MAC address
+                                // uint8_t mac[6];
+                                // esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                                // char unique_device_id[32];
+                                // snprintf(unique_device_id, sizeof(unique_device_id),
+                                //         "%02X%02X%02X%02X%02X%02X",
+                                //         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                                // printf("<s>10003,%s<e>\n", unique_device_id);
+                            }
                             else if (first_token == 10004)
                                 xTaskCreate(pulseOutputTask, "PulseOutputTask", 2048, NULL, 5, NULL);
                             else if (first_token == 10005)
                             {
+                                printf("<s>10005,%s<e>\n", "Resetting device...");
                                 esp_restart();
                             }
                             else if (first_token == 99999)
                             {
                                 save_nvs_i32("storage", "statsPulse", 0);
                                 save_nvs_i32("storage", "statsMoney", 0);
+                                printf("<s>99999,%s<e>\n", "Resetting pulse...");
                             }
                             else if (first_token == 77777)
                             {
-                                char query_ping_server[32];  // Reduced size for simple <PING> command
+                                char query_ping_server[32]; // Reduced size for simple <PING> command
                                 snprintf(query_ping_server, sizeof(query_ping_server), "<PING>");
 
                                 int32_t is_wifiorlan = 0;
@@ -457,15 +500,18 @@ void uart_response(void *arg)
                             }
                             else if (first_token == 88888)
                             {
+                                printf("<s>88888,%s<e>\n", "Restarting device...");
                                 esp_restart();
                             }
                             else if (first_token == 66661)
                             {
+                                printf("<s>66661,%s<e>\n", "Connecting to Wi-Fi...");
                                 my_wifi_connect();
                                 DEBUG_PRINTLN("Connect Wi-FI");
                             }
                             else if (first_token == 66662)
                             {
+                                printf("<s>66662,%s<e>\n", "Disconnecting Wi-Fi...");
                                 my_wifi_disconnect();
                                 DEBUG_PRINTLN("Disconnect Wi-FI");
                             }
@@ -482,11 +528,14 @@ void uart_response(void *arg)
                                 if (response_wifi)
                                 {
                                     DEBUG_PRINTLN("Response from server : %s", response_wifi);
+                                    // Bebaskan memori yang dialokasikan untuk response
+                                    free(response_wifi);
                                 }
                                 else
                                 {
                                     DEBUG_PRINTLN("Request failed or no response.");
                                 }
+                                printf("<s>66663,%s<e>\n", "Request sent to server");
                             }
                             else if (first_token == 66664)
                             {
@@ -494,6 +543,8 @@ void uart_response(void *arg)
                                     DEBUG_PRINTLN("Wi-Fi is connected");
                                 else
                                     DEBUG_PRINTLN("Wi-Fi is not connected");
+
+                                printf("<s>66664,%s<e>\n", my_wifi_is_connected() == 1 ? "Connected" : "Not Connected");
                             }
 
                             break;
@@ -596,9 +647,7 @@ void app_main(void)
     xTaskCreate(uart_response, "uart_response", 6144, NULL, 10, NULL);
     xTaskCreate(pulse_check_task, "Pulse Check Task", 2048, NULL, 5, NULL);
 
-    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
     gpio_init_custom();
-    xTaskCreate(gpio_task_example, "gpio_task_example", 2048, NULL, 10, NULL);
     pulse_timer = xTimerCreate("pulse_timer", pdMS_TO_TICKS(PULSE_TIMEOUT_MS), pdFALSE, NULL, pulse_timeout_callback);
 
     // ESP_LOGI(TAG, "Turn off LCD backlight");
@@ -949,17 +998,42 @@ void pulse_check_task(void *pvParameters)
         if (pulseCount > 0)
         {
             int remainTime = valueExpiredTimeBill - timeoutInSecond;
+            
+            // Pastikan remainTime tidak negatif untuk menghindari tampilan yang aneh
+            if (remainTime < 0) {
+                remainTime = 0;
+            }
+            
             char bufferRemainTime[16];
             snprintf(bufferRemainTime, sizeof(bufferRemainTime), "%d", remainTime);
-            lv_label_set_text(ui_Label10, bufferRemainTime);
+            
+            // Gunakan lv_async_call untuk thread-safe UI update
+            // Alokasi memori dinamis untuk data yang akan dikirim ke LVGL task
+            char *time_data = malloc(16);
+            if (time_data != NULL) {
+                strncpy(time_data, bufferRemainTime, 15);
+                time_data[15] = '\0';
+                
+                // Update UI secara thread-safe menggunakan async call
+                lv_async_call(update_remain_time_label, time_data);
+            } else {
+                DEBUG_PRINTLN("ERROR: Failed to allocate memory for UI update");
+            }
 
             if (isPreviewShow == 0)
             {
                 isPreviewShow = 1;
+                // halaman preview pulsa dan waktu timeout
                 lv_async_call(go_page9, NULL);
             }
             if (timeoutInSecond > valueExpiredTimeBill)
             {
+                // Hentikan timer pulse_timer
+                if (pulse_timer != NULL)
+                {
+                    xTimerStop(pulse_timer, 0);
+                }
+
                 // ESP_LOGI(TAG, "Time is UP!");
                 pulseCount = 0;
                 timeoutInSecond = 0;
@@ -1000,12 +1074,26 @@ void get_update_device(void *pvParameters)
     {
         DEBUG_PRINTLN("Network connection not configured (is_wifiorlan = %d)", (int)is_wifiorlan);
     }
-    
-    // Check remaining stack before task deletion (only if DEBUG_MODE enabled)
-    #if DEBUG_MODE
+
+// Check remaining stack before task deletion (only if DEBUG_MODE enabled)
+#if DEBUG_MODE
     UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
     DEBUG_PRINTLN("get_update_device stack remaining: %u bytes", (unsigned int)uxHighWaterMark);
-    #endif
-    
+#endif
+
     vTaskDelete(NULL);
+}
+
+// Implementasi fungsi helper untuk update UI secara thread-safe
+void update_remain_time_label(void *data)
+{
+    char *time_str = (char *)data;
+    if (time_str != NULL) {
+        if (ui_Label10 != NULL) {
+            // Fungsi ini akan dipanggil dari LVGL task yang sudah memiliki proper locking
+            lv_label_set_text(ui_Label10, time_str);
+        }
+        // Bebaskan memori yang dialokasikan di pulse_check_task
+        free(time_str);
+    }
 }

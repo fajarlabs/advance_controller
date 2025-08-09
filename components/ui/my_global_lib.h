@@ -5,7 +5,7 @@
 #include <stdio.h>
 
 // Debug configuration - Set to 1 to enable debug prints, 0 to disable
-#define DEBUG_MODE 0
+#define DEBUG_MODE 1
 
 // Debug print macros
 #if DEBUG_MODE

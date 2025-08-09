@@ -32,12 +32,18 @@ static lv_timer_t *wifi_blink_timer = NULL;
 static lv_timer_t *wifi_status_check_timer = NULL;
 static bool wifi_blink_state = true;
 
+// Spinner management variables
+static volatile bool spinner_active = false;
+
 void button_cb_call_midtrans(lv_event_t *e);
 void screen2_event_handler(lv_event_t *e);
 void hotspot_event_cb(lv_event_t *e);
 void payment_request_task(void *pvParameters);
 void update_wifi_signal_indicator(void);
 void wifi_blink_timer_cb(lv_timer_t *timer);
+void show_spinner_safe(void *param);
+void hide_spinner_safe(void *param);
+void refresh_spinner_safe(void *param);
 void wifi_status_check_timer_cb(lv_timer_t *timer);
 bool check_internet_connectivity(void);
 void payment_complete_callback(void *param);
@@ -55,8 +61,8 @@ void screen2_event_handler(lv_event_t *e)
         lv_obj_clear_state(ui_Button1, LV_STATE_DISABLED);  // Hapus status disable
         lv_obj_add_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE); // Tambahkan klik lagi
 
-        // Sembunyikan spinner (init tersembunyi)
-        lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+        // PERBAIKAN: Sembunyikan spinner dan reset status
+        hide_spinner_safe(NULL);
         
         // Initialize WiFi signal indicator
         update_wifi_signal_indicator();
@@ -74,23 +80,39 @@ void screen2_event_handler(lv_event_t *e)
     }
     else if (code == LV_EVENT_SCREEN_UNLOADED)
     {
-        // Cleanup when screen is unloaded
-        if (wifi_blink_timer != NULL) {
-            lv_timer_delete(wifi_blink_timer);
-            wifi_blink_timer = NULL;
-        }
+        DEBUG_PRINTLN("Screen2 unloading - starting cleanup...");
+        
+        // PERBAIKAN: Immediately stop and delete timers first to prevent race conditions
         if (wifi_status_check_timer != NULL) {
             lv_timer_delete(wifi_status_check_timer);
             wifi_status_check_timer = NULL;
+            DEBUG_PRINTLN("WiFi status check timer deleted during unload");
         }
+        if (wifi_blink_timer != NULL) {
+            lv_timer_delete(wifi_blink_timer);
+            wifi_blink_timer = NULL;
+            DEBUG_PRINTLN("WiFi blink timer deleted during unload");
+        }
+        
+        // PERBAIKAN: Force hide spinner dan stop animation sebelum screen unload
+        if (ui_Spinner2 != NULL) {
+            // Stop animation immediately untuk mencegah freeze
+            lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+            
+            // Clear semua animation yang mungkin berjalan
+            lv_anim_delete(ui_Spinner2, NULL);
+            
+            DEBUG_PRINTLN("Spinner animation stopped and hidden");
+        }
+        
+        // Reset spinner status
+        spinner_active = false;
+        
         DEBUG_PRINTLN("Screen2 unloaded - cleanup completed");
         
         // Reset task control variables
         payment_task_running = false;
         active_payment_tasks = 0;
-        
-        // Update WiFi signal indicator
-        update_wifi_signal_indicator();
     }
 }
 
@@ -180,7 +202,11 @@ void ui_Screen2_screen_init(void)
     lv_obj_set_style_text_color(ui_Label2, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Spinner2 = lv_spinner_create(ui_Screen2);
-    // lv_spinner_set_anim_params(ui_Spinner2, 1000, 90);
+    
+    // PERBAIKAN: Konfigurasi parameter animasi secara eksplisit
+    // Duration: 1000ms (1 detik per putaran), Angle: 270 derajat (3/4 lingkaran)
+    lv_spinner_set_anim_params(ui_Spinner2, 1000, 270);
+    
     lv_obj_set_width(ui_Spinner2, 163);
     lv_obj_set_height(ui_Spinner2, 153);
     lv_obj_set_x(ui_Spinner2, 8);
@@ -190,6 +216,10 @@ void ui_Screen2_screen_init(void)
     // Warna bagian berputar (indikator) coklat tua
     lv_obj_set_style_arc_color(ui_Spinner2, lv_color_hex(0xFF2600), LV_PART_INDICATOR | LV_STATE_DEFAULT);
     lv_obj_set_style_arc_opa(ui_Spinner2, LV_OPA_COVER, LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    
+    // PERBAIKAN: Tambah background arc styling untuk kontras yang lebih baik
+    lv_obj_set_style_arc_color(ui_Spinner2, lv_color_hex(0x404040), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_arc_opa(ui_Spinner2, LV_OPA_30, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     // Nonaktifkan klik
     lv_obj_remove_flag(ui_Spinner2, LV_OBJ_FLAG_CLICKABLE);
@@ -256,24 +286,92 @@ void payment_request_task(void *pvParameters)
         /*bool lan_result = */send_at_command(post_request);
         //DEBUG_PRINTLN("LAN request completed with result: %s", lan_result ? "success" : "failed");
         
-        // For LAN, shorter delay since UART response is faster
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        // PERBAIKAN: Enhanced monitoring untuk LAN juga
+        for (int i = 0; i < 20; i++) { // 20 x 50ms = 1 second total, lebih responsive
+            // Multiple condition checks untuk early exit
+            if (!payment_task_running) {
+                DEBUG_PRINTLN("Payment task cancelled during LAN processing (iteration %d)", i);
+                break;
+            }
+            if (ui_Spinner2 == NULL) {
+                DEBUG_PRINTLN("Screen changed during LAN processing (iteration %d)", i);
+                break;
+            }
+            if (!spinner_active) {
+                DEBUG_PRINTLN("Spinner deactivated during LAN processing (iteration %d)", i);
+                break;
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
     else if (is_wifiorlan == NETWORK_WIFI) // using WiFi
     { 
         DEBUG_PRINTLN("Request Using Wi-Fi");
-        make_http_request(post_request);
         
-        // For WiFi, moderate delay since HTTP processing can take time
-        // But if successful, execute_payment will redirect to page 8 automatically
-        DEBUG_PRINTLN("Waiting for HTTP response processing...");
-        vTaskDelay(pdMS_TO_TICKS(5000)); // 5 second delay - reasonable for HTTP processing
+        // PERBAIKAN: Add pre-request delay dengan spinner check untuk memastikan spinner aktif
+        for (int i = 0; i < 5; i++) { // 5 x 100ms = 500ms pre-delay
+            if (!payment_task_running || ui_Spinner2 == NULL) {
+                DEBUG_PRINTLN("Payment task cancelled before HTTP request");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        // Check lagi sebelum HTTP request
+        if (!payment_task_running || ui_Spinner2 == NULL) {
+            DEBUG_PRINTLN("Skipping HTTP request - task cancelled or screen changed");
+        } else {
+            DEBUG_PRINTLN("Sending HTTP request...");
+            make_http_request(post_request);
+            
+            // PERBAIKAN: Post-request monitoring dengan shorter intervals dan spinner refresh
+            DEBUG_PRINTLN("Monitoring HTTP response processing...");
+            for (int i = 0; i < 100; i++) { // 100 x 50ms = 5 seconds total, lebih responsive
+                // Multiple condition checks untuk early exit
+                if (!payment_task_running) {
+                    DEBUG_PRINTLN("Payment task cancelled during WiFi processing (iteration %d)", i);
+                    break;
+                }
+                if (ui_Spinner2 == NULL) {
+                    DEBUG_PRINTLN("Screen changed during WiFi processing (iteration %d)", i);
+                    break;
+                }
+                if (!spinner_active) {
+                    DEBUG_PRINTLN("Spinner deactivated during WiFi processing (iteration %d)", i);
+                    break;
+                }
+                
+                // PERBAIKAN: Refresh spinner animation setiap 1 detik untuk mencegah freeze
+                if (i % 20 == 0 && i > 0) { // Setiap 20 iterations (1 second)
+                    lv_async_call(refresh_spinner_safe, NULL);
+                    DEBUG_PRINTLN("WiFi processing... %d seconds elapsed (spinner refreshed)", i/20);
+                }
+                
+                // Shorter delay untuk lebih responsive
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
     }
     else
     {
         DEBUG_PRINTLN("Network connection not configured (is_wifiorlan = %d)", (int)is_wifiorlan);
         // Add small delay even for error case
         vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    
+    // PERBAIKAN: Check jika spinner masih valid sebelum cleanup
+    // Jika halaman sudah pindah, ui_Spinner2 mungkin sudah NULL
+    if (ui_Spinner2 == NULL) {
+        DEBUG_PRINTLN("Spinner object is NULL - screen probably changed, skipping UI cleanup");
+        // Just cleanup memory and exit
+        DEBUG_PRINTLN("Freeing allocated post_request memory at: %p", post_request);
+        free(post_request);
+        post_request = NULL;
+        active_payment_tasks--;
+        payment_task_running = false;
+        vTaskDelete(NULL);
+        return;
     }
     
     // Clean up allocated memory and decrement counter
@@ -318,9 +416,14 @@ void button_cb_call_midtrans(lv_event_t *e)
     lv_obj_clear_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_bg_color(ui_Button1, lv_color_hex(0x808080), LV_PART_MAIN | LV_STATE_DEFAULT); // Gray color
     
-    // Show spinner immediately
-    lv_obj_clear_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(ui_Spinner2);
+    // PERBAIKAN: Pause WiFi status check timer during payment processing
+    if (wifi_status_check_timer != NULL) {
+        lv_timer_pause(wifi_status_check_timer);
+        DEBUG_PRINTLN("WiFi status check timer paused during payment processing");
+    }
+    
+    // PERBAIKAN: Show spinner menggunakan thread-safe function
+    lv_async_call(show_spinner_safe, NULL);
     
     // Set task running flag immediately
     payment_task_running = true;
@@ -358,10 +461,17 @@ void button_cb_call_midtrans(lv_event_t *e)
         DEBUG_PRINTLN("CRITICAL: DEVICE_INFO corrupted, aborting payment to prevent crash!");
         // Reset task flag and re-enable button
         payment_task_running = false;
+        
+        // PERBAIKAN: Resume WiFi status check timer pada error
+        if (wifi_status_check_timer != NULL) {
+            lv_timer_resume(wifi_status_check_timer);
+            DEBUG_PRINTLN("WiFi status check timer resumed after payment error");
+        }
+        
         lv_obj_clear_state(ui_Button1, LV_STATE_DISABLED);
         lv_obj_add_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_bg_color(ui_Button1, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT); // Restore red color
-        lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+        lv_async_call(hide_spinner_safe, NULL);
         return;
     }
 
@@ -409,10 +519,17 @@ void button_cb_call_midtrans(lv_event_t *e)
         DEBUG_PRINTLN("ERROR: post_request buffer too small, truncated! written=%d, buffer_size=%d", written, sizeof(post_request));
         // Reset task flag and re-enable button on error
         payment_task_running = false;
+        
+        // PERBAIKAN: Resume WiFi status check timer pada error
+        if (wifi_status_check_timer != NULL) {
+            lv_timer_resume(wifi_status_check_timer);
+            DEBUG_PRINTLN("WiFi status check timer resumed after buffer error");
+        }
+        
         lv_obj_clear_state(ui_Button1, LV_STATE_DISABLED);
         lv_obj_add_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_bg_color(ui_Button1, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT); // Restore red color
-        lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+        lv_async_call(hide_spinner_safe, NULL);
         return;
     }
     
@@ -436,11 +553,18 @@ void button_cb_call_midtrans(lv_event_t *e)
             DEBUG_PRINTLN("Failed to create payment request task");
             free(post_request_copy);
             payment_task_running = false;
+            
+            // PERBAIKAN: Resume WiFi status check timer pada error
+            if (wifi_status_check_timer != NULL) {
+                lv_timer_resume(wifi_status_check_timer);
+                DEBUG_PRINTLN("WiFi status check timer resumed after task creation error");
+            }
+            
             // Re-enable button on error
             lv_obj_clear_state(ui_Button1, LV_STATE_DISABLED);
             lv_obj_add_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_set_style_bg_color(ui_Button1, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT); // Restore red color
-            lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+            lv_async_call(hide_spinner_safe, NULL);
         }
     }
     else
@@ -449,10 +573,17 @@ void button_cb_call_midtrans(lv_event_t *e)
         DEBUG_PRINTLN("Payment task limit reached or memory allocation failed");
         // Reset task flag and re-enable button on error
         payment_task_running = false;
+        
+        // PERBAIKAN: Resume WiFi status check timer pada error
+        if (wifi_status_check_timer != NULL) {
+            lv_timer_resume(wifi_status_check_timer);
+            DEBUG_PRINTLN("WiFi status check timer resumed after memory/limit error");
+        }
+        
         lv_obj_clear_state(ui_Button1, LV_STATE_DISABLED);
         lv_obj_add_flag(ui_Button1, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_bg_color(ui_Button1, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT); // Restore red color
-        lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+        lv_async_call(hide_spinner_safe, NULL);
     }
 
     DEBUG_PRINTLN("Payment Click");
@@ -463,11 +594,14 @@ void payment_complete_callback(void *param)
 {
     DEBUG_PRINTLN("=== PAYMENT COMPLETE CALLBACK ===");
     
-    // Hide spinner
-    if (ui_Spinner2 != NULL) {
-        lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
-        DEBUG_PRINTLN("Spinner hidden");
+    // PERBAIKAN: Resume WiFi status check timer setelah payment selesai
+    if (wifi_status_check_timer != NULL) {
+        lv_timer_resume(wifi_status_check_timer);
+        DEBUG_PRINTLN("WiFi status check timer resumed after payment completion");
     }
+    
+    // PERBAIKAN: Hide spinner menggunakan thread-safe function
+    hide_spinner_safe(NULL);
     
     // Re-enable button dengan debugging
     if (ui_Button1 != NULL) {
@@ -529,6 +663,20 @@ void wifi_status_check_timer_cb(lv_timer_t *timer)
         return;
     }
     
+    // PERBAIKAN: Check if Screen2 is still the active screen
+    // Prevent timer from running if page has changed
+    if (lv_screen_active() != ui_Screen2) {
+        DEBUG_PRINTLN("WiFi status check timer: Screen2 no longer active, skipping");
+        return;
+    }
+    
+    // PERBAIKAN: Additional check - if payment task is running, skip connectivity check
+    // to prevent "Testing network connectivity..." during payment processing
+    if (payment_task_running || active_payment_tasks > 0) {
+        DEBUG_PRINTLN("WiFi status check timer: Payment in progress, skipping connectivity check");
+        return;
+    }
+    
     // Check network type first - don't run WiFi checks if LAN mode is active
     int32_t is_wifiorlan = 0;
     const char *nvs_namespace = "storage";
@@ -557,6 +705,13 @@ void wifi_status_check_timer_cb(lv_timer_t *timer)
 bool check_internet_connectivity(void)
 {
     DEBUG_PRINTLN("Checking internet connectivity...");
+    
+    // PERBAIKAN: Check if Screen2 is still the active screen
+    // Prevent connectivity testing if page has changed
+    if (lv_screen_active() != ui_Screen2) {
+        DEBUG_PRINTLN("check_internet_connectivity: Screen2 no longer active, skipping");
+        return false;
+    }
     
     // Check network type first
     int32_t is_wifiorlan = 0;
@@ -617,6 +772,13 @@ bool check_internet_connectivity(void)
 void update_wifi_signal_indicator(void)
 {
     DEBUG_PRINTLN("update_wifi_signal_indicator called");
+    
+    // PERBAIKAN: Check if Screen2 is still the active screen
+    // Prevent running connectivity checks if page has changed
+    if (lv_screen_active() != ui_Screen2) {
+        DEBUG_PRINTLN("update_wifi_signal_indicator: Screen2 no longer active, skipping");
+        return;
+    }
     
     // Check network type first - disable WiFi signal indicator if LAN mode is active
     int32_t is_wifiorlan = 0;
@@ -742,5 +904,84 @@ void update_wifi_signal_indicator(void)
             lv_obj_set_style_text_color(ui_Label2, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
             DEBUG_PRINTLN("Button text changed to: CASH ONLY");
         }
+    }
+}
+
+// PERBAIKAN: Fungsi thread-safe untuk mengelola spinner dengan enhanced monitoring
+void show_spinner_safe(void *param)
+{
+    if (ui_Spinner2 != NULL && !spinner_active) {
+        // PERBAIKAN: Clear semua animation lama sebelum restart
+        lv_anim_delete(ui_Spinner2, NULL);
+        
+        // Clear hidden flag terlebih dahulu
+        lv_obj_clear_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+        
+        // PERBAIKAN: Set animation parameters dengan explicit restart
+        lv_spinner_set_anim_params(ui_Spinner2, 800, 270); // Slightly faster animation untuk better visual feedback
+        
+        // Move to foreground dengan force
+        lv_obj_move_foreground(ui_Spinner2);
+        
+        // PERBAIKAN: Force invalidate untuk memastikan redraw
+        lv_obj_invalidate(ui_Spinner2);
+        
+        // Set active flag
+        spinner_active = true;
+        
+        DEBUG_PRINTLN("Spinner shown with enhanced animation restart (800ms cycle)");
+    } else if (ui_Spinner2 == NULL) {
+        DEBUG_PRINTLN("Cannot show spinner - object is NULL");
+        spinner_active = false; // Reset flag untuk safety
+    } else {
+        DEBUG_PRINTLN("Spinner already active - refreshing animation");
+        // PERBAIKAN: Refresh animation even if already active
+        if (ui_Spinner2 != NULL) {
+            lv_anim_delete(ui_Spinner2, NULL);
+            lv_spinner_set_anim_params(ui_Spinner2, 800, 270);
+            lv_obj_invalidate(ui_Spinner2);
+        }
+    }
+}
+
+void hide_spinner_safe(void *param)
+{
+    if (ui_Spinner2 != NULL) {
+        // PERBAIKAN: Stop semua animation sebelum hide
+        lv_anim_delete(ui_Spinner2, NULL);
+        
+        // Hide spinner
+        lv_obj_add_flag(ui_Spinner2, LV_OBJ_FLAG_HIDDEN);
+        
+        // Clear active flag
+        spinner_active = false;
+        
+        DEBUG_PRINTLN("Spinner hidden with animation cleanup");
+    } else {
+        // Clear flag even jika object NULL
+        spinner_active = false;
+        DEBUG_PRINTLN("Spinner object NULL - only cleared active flag");
+    }
+}
+
+// PERBAIKAN: Fungsi untuk refresh spinner animation tanpa hide/show
+void refresh_spinner_safe(void *param)
+{
+    if (ui_Spinner2 != NULL && spinner_active) {
+        // Clear existing animations
+        lv_anim_delete(ui_Spinner2, NULL);
+        
+        // Restart animation dengan parameter yang sama
+        lv_spinner_set_anim_params(ui_Spinner2, 800, 270);
+        
+        // Force redraw
+        lv_obj_invalidate(ui_Spinner2);
+        
+        DEBUG_PRINTLN("Spinner animation refreshed");
+    } else if (ui_Spinner2 == NULL) {
+        DEBUG_PRINTLN("Cannot refresh spinner - object is NULL");
+        spinner_active = false;
+    } else if (!spinner_active) {
+        DEBUG_PRINTLN("Spinner not active - skipping refresh");
     }
 }
