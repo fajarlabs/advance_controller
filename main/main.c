@@ -264,20 +264,29 @@ void pulse_timeout_callback(TimerHandle_t xTimer)
     if (load_nvs_i32("storage", "RateConversion", &valueRateConversion) != ESP_OK)
         valueRateConversion = 0;
 
-    // ESP_LOGI(TAG, "Pulse sequence complete. Total pulses: %d", pulseCount);
-    int realPulse = pulseCount;
-    int totalMoneyPulse = valueRateConversion * realPulse;
-
-    int validUnits = totalMoneyPulse / valueMoney;
-    int sisa = totalMoneyPulse % valueMoney; // sisa pembagian
+    int realPulse = pulseCount; // contoh 50
+    int totalMoneyPulse = valueRateConversion * realPulse; // contoh 1000 x 50 = 50000
+    int validUnits = totalMoneyPulse / valueMoney; // contoh 50000 / 20000 = 2.5
+    int sisa = totalMoneyPulse % valueMoney; // contoh 50000 % 20000 = 10000
 
     if (validUnits > 0) // Ada minimal 1 unit uang valid
     {
+        printf("Pulsa sebenarnya : %d\n", realPulse);
         // Proses bagian uang yang valid (kelipatan 10000)
         int decreasePulse = (validUnits * valueMoney) / valueRateConversion;
-        pulseCount -= decreasePulse;
+        printf("Dapat pulsa: %d, Pulsa dikurangi: %d\n", validUnits, decreasePulse);
 
-        for (int i = 0; i < (valuePulse * validUnits); i++)
+        pulseCount -= decreasePulse; // contoh 50 - 40 = 10
+
+        if(ui_Label11 != NULL) {
+            char bufferSisa[16];
+            snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
+            lv_label_set_text(ui_Label11, bufferSisa); // valid
+            printf("Tampilkan sisa : %s\n", bufferSisa);
+        }
+
+        printf("Pulsa : %ld * Unit valid: %d = %ld\n", valuePulse, validUnits, (long int)(valuePulse * validUnits));
+        for (int i = 0; i < (valuePulse * validUnits); i++) // 1 x 2 = 2 pulse
         {
             gpio_set_level(GPIO_OUTPUT_PIN, 1);
             vTaskDelay(pdMS_TO_TICKS(valueDuty));
@@ -318,20 +327,16 @@ void pulse_timeout_callback(TimerHandle_t xTimer)
 
         gpio_set_level(GPIO_OUTPUT_PIN, 0);
 
-        // Kalau ada sisa, tampilkan di label preview
+        // Kalau ada sisa, reset waktu kembali ke hitungan awal, tapi JANGAN tampilkan di label preview di sini
         if (sisa > 0)
         {
-            char bufferSisa[16];
-            snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
-            lv_label_set_text(ui_Label11, bufferSisa);
-            DEBUG_PRINTLN("Kondisi sisa > 0");
-
+            printf("Kondisi sisa > 0\n");
             // Reset waktu kembali ke hitungan awal jika ada sisa
             timeoutInSecond = 0;
         } else {
             // pindah ke halaman sukses
             lv_async_call(go_page6, NULL);
-            
+
             // Reset timeout dan preview
             timeoutInSecond = 0;
             isPreviewShow = 0;
@@ -342,11 +347,13 @@ void pulse_timeout_callback(TimerHandle_t xTimer)
                 lv_label_set_text(ui_Label11, "0");
             }
 
-            DEBUG_PRINTLN("Kondisi sisa <= 0");
+            //DEBUG_PRINTLN("Kondisi sisa <= 0");
+            printf("Kondisi sisa <= 0");
         }
     }
     else
     {
+        printf("Tidak ada uang valid sama sekali, langsung tampilkan total\n");
         // Tidak ada uang valid sama sekali, langsung tampilkan total
         char bufferTotalMoney[16];
         snprintf(bufferTotalMoney, sizeof(bufferTotalMoney), "%d", totalMoneyPulse);
@@ -1046,8 +1053,23 @@ void pulse_check_task(void *pvParameters)
                     xTimerStop(pulse_timer, 0);
                 }
 
-                // ESP_LOGI(TAG, "Time is UP!");
+                // Hitung sisa uang terakhir dan tampilkan di label preview
+                int32_t valueDuty, valueDuration, valuePulse, valueMoney, valueRateConversion;
+                if (load_nvs_i32("storage", "duty", &valueDuty) != ESP_OK) valueDuty = 100;
+                if (load_nvs_i32("storage", "duration", &valueDuration) != ESP_OK) valueDuration = 100;
+                if (load_nvs_i32("storage", "pulse", &valuePulse) != ESP_OK) valuePulse = 0;
+                if (load_nvs_i32("storage", "money", &valueMoney) != ESP_OK) valueMoney = 0;
+                if (load_nvs_i32("storage", "RateConversion", &valueRateConversion) != ESP_OK) valueRateConversion = 0;
+                int realPulse = pulseCount;
+                int totalMoneyPulse = valueRateConversion * realPulse;
+                int sisa = totalMoneyPulse % valueMoney;
+                if (sisa > 0 && ui_Label11 != NULL) {
+                    char bufferSisa[16];
+                    snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
+                    lv_label_set_text(ui_Label11, bufferSisa);
+                }
 
+                // ESP_LOGI(TAG, "Time is UP!");
 
                 // Reset all if time is up
                 pulseCount = 0;
