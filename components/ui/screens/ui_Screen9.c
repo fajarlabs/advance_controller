@@ -48,6 +48,7 @@ void ui_Screen9_screen_init(void)
     lv_label_set_text(ui_Label9, "Batas waktu");
     lv_obj_set_style_text_font(ui_Label9, &lv_font_montserrat_18, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    // Batas Waktu
     ui_Label10 = lv_label_create(ui_Screen9);
     lv_obj_set_width(ui_Label10, LV_SIZE_CONTENT);   /// 1
     lv_obj_set_height(ui_Label10, LV_SIZE_CONTENT);    /// 1
@@ -57,6 +58,7 @@ void ui_Screen9_screen_init(void)
     lv_label_set_text(ui_Label10, "0");
     lv_obj_set_style_text_font(ui_Label10, &lv_font_montserrat_34, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    // Uang Sisa
     ui_Label11 = lv_label_create(ui_Screen9);
     lv_obj_set_width(ui_Label11, LV_SIZE_CONTENT);   /// 1
     lv_obj_set_height(ui_Label11, LV_SIZE_CONTENT);    /// 1

@@ -324,13 +324,25 @@ void pulse_timeout_callback(TimerHandle_t xTimer)
             char bufferSisa[16];
             snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
             lv_label_set_text(ui_Label11, bufferSisa);
+            DEBUG_PRINTLN("Kondisi sisa > 0");
+
+            // Reset waktu kembali ke hitungan awal jika ada sisa
+            timeoutInSecond = 0;
         } else {
             // pindah ke halaman sukses
             lv_async_call(go_page6, NULL);
+            
             // Reset timeout dan preview
             timeoutInSecond = 0;
             isPreviewShow = 0;
             pulseCount = 0; // Reset pulse count
+
+            // Reset label sisa ke 0 agar tidak tertambah di proses berikutnya
+            if (ui_Label11 != NULL) {
+                lv_label_set_text(ui_Label11, "0");
+            }
+
+            DEBUG_PRINTLN("Kondisi sisa <= 0");
         }
     }
     else
@@ -1035,9 +1047,14 @@ void pulse_check_task(void *pvParameters)
                 }
 
                 // ESP_LOGI(TAG, "Time is UP!");
+
+
+                // Reset all if time is up
                 pulseCount = 0;
                 timeoutInSecond = 0;
                 isPreviewShow = 0;
+
+                // go to page failed
                 lv_async_call(go_page4, NULL);
             }
             timeoutInSecond++;
