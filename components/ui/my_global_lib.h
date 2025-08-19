@@ -6,7 +6,7 @@
 
 // Debug configuration - Set to 1 to enable debug prints, 0 to disable
 #define DEBUG_MODE 0
-#define DEBUG_TRANSACTION_FLOW 0
+#define DEBUG_TRANSACTION_FLOW 1
 #define IS_PRODUCTION 0
 
 // Debug print macros

@@ -31,6 +31,7 @@
 #include <string.h>
 #include "my_global_lib.h"
 #include "transaction.h"
+#include "esp_heap_caps.h"
 
 #if CONFIG_MCU_LCD_CONTROLLER_ILI9341
 #include "esp_lcd_ili9341.h"
@@ -47,6 +48,7 @@ void pulse_check_task(void *pvParameters);
 void screen4_set_message(const char *message); // deklarasi agar tidak implicit
 void get_update_device(void *pvParameters);
 void cleanup_device_info(void);
+void heap_monitor_task(void *pvParameters);
 
 #define LCD_HOST SPI3_HOST
 #define TOUCH_HOST SPI2_HOST
@@ -195,10 +197,12 @@ void update_remain_time_label(void *data);
 #define PULSE_TIMEOUT_MS 500
 #define BILL_ACCEPTOR_GPIO GPIO_NUM_4
 
-static volatile int pulseCount = 0;
+static volatile int rawPulseCount = 0; // Counter mentah dari ISR
+static int pulseCount = 0; // Counter untuk proses bisnis (decrease, koreksi, dsb)
 static volatile int timeoutInSecond = 0;
 static volatile int isPreviewShow = 0;
 static TimerHandle_t pulse_timer;
+static volatile bool pulse_process_flag = false;
 
 void save_info_task(void *pvParameters)
 {
@@ -250,146 +254,162 @@ void save_info_task(void *pvParameters)
 
 void pulse_timeout_callback(TimerHandle_t xTimer)
 {
-    int32_t valueDuty;
-    int32_t valueDuration;
-    int32_t valuePulse;
-    int32_t valueMoney;
-    int32_t valueRateConversion;
+    pulse_process_flag = true;
+}
 
-    if (load_nvs_i32("storage", "duty", &valueDuty) != ESP_OK)
-        valueDuty = 100;
-    if (load_nvs_i32("storage", "duration", &valueDuration) != ESP_OK)
-        valueDuration = 100;
-    if (load_nvs_i32("storage", "pulse", &valuePulse) != ESP_OK)
-        valuePulse = 0;
-    if (load_nvs_i32("storage", "money", &valueMoney) != ESP_OK)
-        valueMoney = 0;
-    if (load_nvs_i32("storage", "RateConversion", &valueRateConversion) != ESP_OK)
-        valueRateConversion = 0;
+void pulse_process_task(void *pvParameters)
+{
+    while (1) {
+        if (pulse_process_flag) {
+            pulse_process_flag = false;
+            int32_t valueDuty;
+            int32_t valueDuration;
+            int32_t valuePulse;
+            int32_t valueMoney;
+            int32_t valueRateConversion;
+            if (load_nvs_i32("storage", "duty", &valueDuty) != ESP_OK)
+                valueDuty = 100;
+            if (load_nvs_i32("storage", "duration", &valueDuration) != ESP_OK)
+                valueDuration = 100;
+            if (load_nvs_i32("storage", "pulse", &valuePulse) != ESP_OK)
+                valuePulse = 0;
+            if (load_nvs_i32("storage", "money", &valueMoney) != ESP_OK)
+                valueMoney = 0;
+            if (load_nvs_i32("storage", "RateConversion", &valueRateConversion) != ESP_OK)
+                valueRateConversion = 0;
 
-    int realPulse = pulseCount;                            // contoh 50
-    int totalMoneyPulse = valueRateConversion * realPulse; // contoh 1000 x 50 = 50000
-    int validUnits = totalMoneyPulse / valueMoney;         // contoh 50000 / 20000 = 2.5
-    int sisa = totalMoneyPulse % valueMoney;               // contoh 50000 % 20000 = 10000
+            if (rawPulseCount > 0) {
+                if(rawPulseCount >= 101 && rawPulseCount < 110){
+                    pulseCount += 100;
+                } else if(rawPulseCount >= 51 && rawPulseCount < 55){
+                    pulseCount += 50;
+                } else if(rawPulseCount >= 21 && rawPulseCount < 25){
+                    pulseCount += 20;
+                } else if(rawPulseCount >= 11 && rawPulseCount < 15){
+                    pulseCount += 10;
+                } else if(rawPulseCount >= 5 && rawPulseCount < 10){
+                    pulseCount += 5;
+                } else if(rawPulseCount >= 2 && rawPulseCount < 5){
+                    pulseCount += 2;
+                } else {
+                    pulseCount += rawPulseCount;
+                }
+            }
+            rawPulseCount = 0;
 
-    // ini kondisi dimana sisa uang lebih
-    if (validUnits > 0) // Ada minimal 1 unit uang valid
-    {
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Pulsa sebenarnya : %d\n", realPulse);
-        // Proses bagian uang yang valid (kelipatan 10000)
-        int decreasePulse = (validUnits * valueMoney) / valueRateConversion;
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Dapat pulsa: %d, Pulsa dikurangi: %d\n", validUnits, decreasePulse);
-
-        pulseCount -= decreasePulse; // contoh 50 - 40 = 10
-
-        if (ui_Label11 != NULL)
-        {
-            char bufferSisa[16];
-            snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
-            lv_label_set_text(ui_Label11, bufferSisa); // valid
-            if (DEBUG_TRANSACTION_FLOW)
-                printf("Tampilkan sisa : %s\n", bufferSisa);
-        }
-
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Pulsa : %ld * Unit valid: %d = %ld\n", valuePulse, validUnits, (long int)(valuePulse * validUnits));
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Relay pulse ON\n");
-        for (int i = 0; i < (valuePulse * validUnits); i++) // 1 x 2 = 2 pulse
-        {
-            gpio_set_level(GPIO_OUTPUT_PIN, 1);
-            vTaskDelay(pdMS_TO_TICKS(valueDuty));
-            gpio_set_level(GPIO_OUTPUT_PIN, 0);
-            vTaskDelay(pdMS_TO_TICKS(valueDuration));
-        }
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Relay pulse OFF\n");
-
-        // Simpan statsPulse
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Simpan state pulse\n");
-        int32_t valueStatsHistory;
-        if (load_nvs_i32("storage", "statsPulse", &valueStatsHistory) != ESP_OK)
-            valueStatsHistory = 0;
-        int32_t newvalueStatsHistory = valueStatsHistory + (valuePulse * validUnits);
-        if (newvalueStatsHistory > 9999)
-            save_nvs_i32("storage", "statsPulse", 0);
-        else
-            save_nvs_i32("storage", "statsPulse", newvalueStatsHistory);
-
-        // Simpan statsMoney
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Simpan state money\n");
-        int32_t valueMoneyHistory;
-        if (load_nvs_i32("storage", "statsMoney", &valueMoneyHistory) != ESP_OK)
-            valueMoneyHistory = 0;
-        int32_t newvalueMoneyHistory = valueMoneyHistory + (validUnits * valueMoney);
-        if (newvalueMoneyHistory > 5000000)
-        {
-            newvalueMoneyHistory = newvalueMoneyHistory - valueMoneyHistory;
-            save_nvs_i32("storage", "statsMoney", newvalueMoneyHistory);
-        }
-        else
-        {
-            save_nvs_i32("storage", "statsMoney", newvalueMoneyHistory);
-        }
-
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Simpan state pulse\n");
-        transaction_params_t *params = malloc(sizeof(transaction_params_t));
-        strcpy(params->device_id, CONFIG_MCU_DEVICEID);
-        strcpy(params->unit_sn, DEVICE_INFO.UnitSn);
-        params->gross_price = validUnits * valueMoney;
-        xTaskCreate(&save_info_task, "save_info_task", 8192, params, 5, NULL);
-
-        gpio_set_level(GPIO_OUTPUT_PIN, 0);
-
-        // Kalau ada sisa, reset waktu kembali ke hitungan awal, tapi JANGAN tampilkan di label preview di sini
-        if (sisa > 0)
-        {
-            if (DEBUG_TRANSACTION_FLOW)
-                printf("Sisa masih ada : %d\n", sisa);
-            // Reset waktu kembali ke hitungan awal jika ada sisa
-            if (DEBUG_TRANSACTION_FLOW)
-                printf("Sisa masih ada jadi di reset lagi waktunya\n");
-            timeoutInSecond = 0;
-        }
-        else
-        {
-            // Reset timeout dan preview
-            if (DEBUG_TRANSACTION_FLOW)
-                printf("Tidak ada sisa, reset timeout, preview dan pulse\n");
-            timeoutInSecond = 0;
-            isPreviewShow = 0;
-            pulseCount = 0; // Reset pulse count
-
-            // lv_label_set_text harus di update terlebih dahulu sebelum lv_async_call
-            // Reset label sisa ke 0 agar tidak tertambah di proses berikutnya
-            if (ui_Label11 != NULL)
+            int realPulse = pulseCount;
+            int totalMoneyPulse = valueRateConversion * realPulse;
+            int validUnits = totalMoneyPulse / valueMoney;
+            int sisa = totalMoneyPulse % valueMoney;
+            if (validUnits > 0)
             {
                 if (DEBUG_TRANSACTION_FLOW)
-                    printf("Reset tampilkan preview ke 0\n");
-                lv_label_set_text(ui_Label11, "0");
+                    printf("Pulsa sebenarnya : %d\n", realPulse);
+                int decreasePulse = (validUnits * valueMoney) / valueRateConversion;
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Dapat pulsa: %d, Pulsa dikurangi: %d\n", validUnits, decreasePulse);
+                pulseCount -= decreasePulse;
+                if (ui_Label11 != NULL)
+                {
+                    char bufferSisa[16];
+                    snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
+                    lv_label_set_text(ui_Label11, bufferSisa);
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Munculkan ke display, tampilkan sisa : %s\n", bufferSisa);
+                }
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Pulsa : %ld * Unit valid: %d = %ld\n", valuePulse, validUnits, (long int)(valuePulse * validUnits));
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Relay pulse ON\n");
+                for (int i = 0; i < (valuePulse * validUnits); i++)
+                {
+                    gpio_set_level(GPIO_OUTPUT_PIN, 1);
+                    vTaskDelay(pdMS_TO_TICKS(valueDuty));
+                    gpio_set_level(GPIO_OUTPUT_PIN, 0);
+                    vTaskDelay(pdMS_TO_TICKS(valueDuration));
+                }
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Relay pulse OFF\n");
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Simpan state pulse\n");
+                int32_t valueStatsHistory;
+                if (load_nvs_i32("storage", "statsPulse", &valueStatsHistory) != ESP_OK)
+                    valueStatsHistory = 0;
+                int32_t newvalueStatsHistory = valueStatsHistory + (valuePulse * validUnits);
+                if (newvalueStatsHistory > 9999)
+                    save_nvs_i32("storage", "statsPulse", 0);
+                else
+                    save_nvs_i32("storage", "statsPulse", newvalueStatsHistory);
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Simpan state money\n");
+                int32_t valueMoneyHistory;
+                if (load_nvs_i32("storage", "statsMoney", &valueMoneyHistory) != ESP_OK)
+                    valueMoneyHistory = 0;
+                int32_t newvalueMoneyHistory = valueMoneyHistory + (validUnits * valueMoney);
+                if (newvalueMoneyHistory > 5000000)
+                {
+                    newvalueMoneyHistory = newvalueMoneyHistory - valueMoneyHistory;
+                    save_nvs_i32("storage", "statsMoney", newvalueMoneyHistory);
+                }
+                else
+                {
+                    save_nvs_i32("storage", "statsMoney", newvalueMoneyHistory);
+                }
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Simpan state pulse\n");
+                transaction_params_t *params = malloc(sizeof(transaction_params_t));
+                if (IS_PRODUCTION == 0)
+                {
+                    strcpy(params->device_id, CONFIG_MCU_DEVICEID);
+                } else {
+                    uint8_t mac[6];
+                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                    char unique_device_id[32];
+                    snprintf(unique_device_id, sizeof(unique_device_id),
+                                "%02X%02X%02X%02X%02X%02X",
+                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                    strcpy(params->device_id, unique_device_id);
+                }
+                strcpy(params->unit_sn, DEVICE_INFO.UnitSn);
+                params->gross_price = validUnits * valueMoney;
+                xTaskCreate(&save_info_task, "save_info_task", 8192, params, 5, NULL);
+                gpio_set_level(GPIO_OUTPUT_PIN, 0);
+                if (sisa > 0)
+                {
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Sisa masih ada : %d\n", sisa);
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Sisa masih ada jadi di reset lagi waktunya\n");
+                    timeoutInSecond = 0;
+                }
+                else
+                {
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Tidak ada sisa, reset timeout, preview dan pulse\n");
+                    timeoutInSecond = 0;
+                    isPreviewShow = 0;
+                    pulseCount = 0;
+                    rawPulseCount = 0;
+                    if (ui_Label11 != NULL)
+                    {
+                        if (DEBUG_TRANSACTION_FLOW)
+                            printf("Reset tampilkan preview ke 0\n");
+                        lv_label_set_text(ui_Label11, "0");
+                    }
+                    lv_async_call(go_page6, NULL);
+                }
             }
-
-            // DEBUG_PRINTLN("Kondisi sisa <= 0");
-            if (DEBUG_TRANSACTION_FLOW)
-                printf("Tidak ada sisa\n");
-
-            // pindah ke halaman sukses
-            lv_async_call(go_page6, NULL);
+            else
+            {
+                if (DEBUG_TRANSACTION_FLOW)
+                    printf("Uang masih kurang, langsung tampilkan total\n");
+                char bufferTotalMoney[16];
+                snprintf(bufferTotalMoney, sizeof(bufferTotalMoney), "%d", totalMoneyPulse);
+                if(ui_Label11 != NULL)
+                    lv_label_set_text(ui_Label11, bufferTotalMoney);
+            }
         }
-    }
-    else // ini kondisi dimana uang kurang
-    {
-        if (DEBUG_TRANSACTION_FLOW)
-            printf("Uang masih kurang, langsung tampilkan total\n");
-        // Tidak ada uang valid sama sekali, langsung tampilkan total
-        char bufferTotalMoney[16];
-        snprintf(bufferTotalMoney, sizeof(bufferTotalMoney), "%d", totalMoneyPulse);
-        lv_label_set_text(ui_Label11, bufferTotalMoney);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -403,7 +423,7 @@ static void IRAM_ATTR my_gpio_isr_handler(void *arg)
     int64_t now = esp_timer_get_time();
     if (now - last_pulse_time_us > DEBOUNCE_US)
     {
-        pulseCount++;
+        rawPulseCount++;
         last_pulse_time_us = now;
     }
 
@@ -573,7 +593,21 @@ void uart_response(void *arg)
 
                                 // Kirim request - /endpoint akan ditambahkan otomatis di fungsi
                                 char post_data[64];
-                                snprintf(post_data, sizeof(post_data), "<GETINFO,%s>", CONFIG_MCU_DEVICEID);
+
+                                if (IS_PRODUCTION == 0) // development
+                                {
+                                    snprintf(post_data, sizeof(post_data), "<GETINFO,%s>", CONFIG_MCU_DEVICEID);
+                                }else // production
+                                {
+                                    uint8_t mac[6];
+                                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                                    char unique_device_id[32];
+                                    snprintf(unique_device_id, sizeof(unique_device_id),
+                                             "%02X%02X%02X%02X%02X%02X",
+                                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                                    snprintf(post_data, sizeof(post_data), "<GETINFO,%s>", unique_device_id);
+                                }
+
                                 char *response_wifi = my_wifi_send_getinfo_request(server_host, post_data);
                                 if (response_wifi)
                                 {
@@ -644,8 +678,7 @@ void uart_response(void *arg)
                     }
                     free(copy);
                     // Free dataExtract to prevent memory leak
-                    if (dataExtract)
-                    {
+                    if (dataExtract) {
                         free(dataExtract);
                     }
                     memmove(data, data + i + 1, pos - i - 1);
@@ -695,7 +728,8 @@ void app_main(void)
     uart_param_config(UART_PORT_MICROUSB, &uart_config);
 
     xTaskCreate(uart_response, "uart_response", 6144, NULL, 10, NULL);
-    xTaskCreate(pulse_check_task, "Pulse Check Task", 2048, NULL, 5, NULL);
+    xTaskCreate(pulse_check_task, "Pulse Check Task", 6144, NULL, 5, NULL);
+    xTaskCreate(pulse_process_task, "pulse_process_task", 8192, NULL, 5, NULL);
 
     gpio_init_custom();
     pulse_timer = xTimerCreate("pulse_timer", pdMS_TO_TICKS(PULSE_TIMEOUT_MS), pdFALSE, NULL, pulse_timeout_callback);
@@ -844,6 +878,9 @@ void app_main(void)
     /* Begin a task to get device updates */
     xTaskCreate(get_update_device, "get_update_device task", 8192, NULL, 10, NULL);
     /* End of task creation */
+
+    // Mulai task monitoring heap
+    xTaskCreate(heap_monitor_task, "heap_monitor_task", 2048, NULL, 1, NULL);
 
     char buffer[300];
 
@@ -1048,53 +1085,41 @@ void pulse_check_task(void *pvParameters)
         if (pulseCount > 0)
         {
             int remainTime = valueExpiredTimeBill - timeoutInSecond;
+            if (remainTime < 0) remainTime = 0;
 
-            // Pastikan remainTime tidak negatif untuk menghindari tampilan yang aneh
-            if (remainTime < 0)
-            {
-                remainTime = 0;
-            }
-
+            // Fungsi hitung mundur
             char bufferRemainTime[16];
             snprintf(bufferRemainTime, sizeof(bufferRemainTime), "%d", remainTime);
-
-            // Gunakan lv_async_call untuk thread-safe UI update
-            // Alokasi memori dinamis untuk data yang akan dikirim ke LVGL task
             char *time_data = malloc(16);
-            if (time_data != NULL)
-            {
+            if (time_data != NULL) {
                 strncpy(time_data, bufferRemainTime, 15);
                 time_data[15] = '\0';
-
-                // Update UI secara thread-safe menggunakan async call
                 lv_async_call(update_remain_time_label, time_data);
-            }
-            else
-            {
+            } else {
                 DEBUG_PRINTLN("ERROR: Failed to allocate memory for UI update");
             }
 
             if (isPreviewShow == 0)
             {
                 isPreviewShow = 1;
-                // halaman preview pulsa dan waktu timeout
-                if (ui_Label11 != NULL)
-                {
-                    if (DEBUG_TRANSACTION_FLOW)
-                        printf("Tampilkan counting..\n");
-                    lv_label_set_text(ui_Label11, "Membaca...");
-                }
+                
+                // ==========================================================
+                // tampilan ini di hide
+                // ==========================================================
+                // if (ui_Label11 != NULL)
+                // {
+                //     if (DEBUG_TRANSACTION_FLOW)
+                //         printf("Tampilkan counting..\n");
+                //     lv_label_set_text(ui_Label11, "Membaca...");
+                // }
                 lv_async_call(go_page9, NULL);
             }
             if (timeoutInSecond > valueExpiredTimeBill)
             {
-                // Hentikan timer pulse_timer
                 if (pulse_timer != NULL)
                 {
                     xTimerStop(pulse_timer, 0);
                 }
-
-                // Hitung sisa uang terakhir dan tampilkan di label preview
                 int32_t valueDuty, valueDuration, valuePulse, valueMoney, valueRateConversion;
                 if (load_nvs_i32("storage", "duty", &valueDuty) != ESP_OK)
                     valueDuty = 100;
@@ -1115,24 +1140,17 @@ void pulse_check_task(void *pvParameters)
                     snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
                     lv_label_set_text(ui_Label11, bufferSisa);
                 }
-
-                // ESP_LOGI(TAG, "Time is UP!");
-
                 // Reset all if time is up
                 pulseCount = 0;
+                rawPulseCount = 0;
                 timeoutInSecond = 0;
                 isPreviewShow = 0;
-
-                // lv_label_set_text harus di set dulu sebelum lv_async_call
-                // Reset label sisa ke 0 agar tidak tertambah di proses berikutnya
                 if (ui_Label11 != NULL)
                 {
                     if (DEBUG_TRANSACTION_FLOW)
                         printf("Reset tampilkan preview ke 0\n");
                     lv_label_set_text(ui_Label11, "0");
                 }
-
-                // go to page failed
                 screen4_set_message("Pembayaran gagal");
                 lv_async_call(go_page4, NULL);
             }
@@ -1152,7 +1170,18 @@ void get_update_device(void *pvParameters)
     // Use static buffer to reduce stack usage
     static char query_req_device[50];
 
-    snprintf(query_req_device, sizeof(query_req_device), "<GETINFO,%s>", CONFIG_MCU_DEVICEID);
+    if (IS_PRODUCTION == 0) // development
+    {
+        snprintf(query_req_device, sizeof(query_req_device), "<GETINFO,%s>", CONFIG_MCU_DEVICEID);
+    } else {
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        char unique_device_id[32];
+        snprintf(unique_device_id, sizeof(unique_device_id),
+                    "%02X%02X%02X%02X%02X%02X",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        snprintf(query_req_device, sizeof(query_req_device), "<GETINFO,%s>", unique_device_id);
+    }
 
     int32_t is_wifiorlan = 0;
     const char *nvs_namespace = "storage";
@@ -1193,5 +1222,16 @@ void update_remain_time_label(void *data)
         }
         // Bebaskan memori yang dialokasikan di pulse_check_task
         free(time_str);
+    }
+}
+
+// Task untuk monitoring sisa heap memory
+void heap_monitor_task(void *pvParameters)
+{
+    while (1)
+    {
+        size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        printf("[HEAP MONITOR] Free heap: %u bytes\n", (unsigned int)free_heap);
+        vTaskDelay(pdMS_TO_TICKS(10000)); // 10 detik
     }
 }
