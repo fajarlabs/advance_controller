@@ -61,6 +61,9 @@ extern ParseInfo DEVICE_INFO;
 extern QrisCpmData QRIS_CPM;
 extern PaymentRoute PAYMENT_ROUTE;
 
+// Variabel global untuk enable/disable ISR pembayaran (misal: bill acceptor)
+extern volatile bool is_payment_isr_enabled;
+
 // Debug function declarations
 void set_debug_mode(bool enable);
 bool get_debug_mode(void);

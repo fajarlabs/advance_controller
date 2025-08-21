@@ -177,6 +177,9 @@ void ui_Screen4_screen_init(void)
 // Timer callback untuk pindah ke screen8
 static void change_to_screen2(lv_timer_t *timer)
 {
+    // Reset ISR enable
+    is_payment_isr_enabled = true; // enable isr bill acceptor
+
     DEBUG_PRINTLN("Pindah ke screen 2");
     // Pindahkan screen ke Screen2
     lv_async_call(go_page2, NULL);

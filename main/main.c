@@ -29,9 +29,11 @@
 #include "usr_k2_lan.h"
 #include "my_wifi.h"
 #include <string.h>
-#include "my_global_lib.h"
 #include "transaction.h"
 #include "esp_heap_caps.h"
+
+// Definisi variabel global (default true)
+volatile bool is_payment_isr_enabled = true;
 
 #if CONFIG_MCU_LCD_CONTROLLER_ILI9341
 #include "esp_lcd_ili9341.h"
@@ -185,10 +187,12 @@ static void my_gpio_isr_handler(void *arg);
 void uart_response(void *arg);
 char *extract_between_std(const char *input);
 void pulseOutputTask();
+void relay_task(void *pvParameters);
 void save_info_task(void *pvParameters);
 
 // Fungsi helper untuk update UI secara thread-safe
 void update_remain_time_label(void *data);
+void update_label11_callback(void *data);
 
 #define GPIO_INPUT_PIN 34  // GPIO pin for pulse input pulse
 #define GPIO_OUTPUT_PIN 26 // GPIO pin for pulse input pulse
@@ -203,6 +207,15 @@ static volatile int timeoutInSecond = 0;
 static volatile int isPreviewShow = 0;
 static TimerHandle_t pulse_timer;
 static volatile bool pulse_process_flag = false;
+
+// Queue untuk perintah relay
+#define RELAY_QUEUE_LENGTH 4
+typedef struct {
+    int pulse_count;
+    int valueDuty;
+    int valueDuration;
+} relay_cmd_t;
+static QueueHandle_t relay_queue = NULL;
 
 void save_info_task(void *pvParameters)
 {
@@ -279,22 +292,39 @@ void pulse_process_task(void *pvParameters)
                 valueRateConversion = 0;
 
             if (rawPulseCount > 0) {
-                if(rawPulseCount >= 101 && rawPulseCount < 110){
-                    pulseCount += 100;
-                } else if(rawPulseCount >= 51 && rawPulseCount < 55){
-                    pulseCount += 50;
-                } else if(rawPulseCount >= 21 && rawPulseCount < 25){
-                    pulseCount += 20;
-                } else if(rawPulseCount >= 11 && rawPulseCount < 15){
-                    pulseCount += 10;
-                } else if(rawPulseCount >= 5 && rawPulseCount < 10){
-                    pulseCount += 5;
-                } else if(rawPulseCount >= 2 && rawPulseCount < 5){
-                    pulseCount += 2;
-                } else {
+                // Mapping: {min, max, value}
+                struct {
+                    int min, max, value;
+                } pulse_map[] = {
+                    {1001, 1010, 1000},
+                    {901, 910, 900},
+                    {801, 810, 800},
+                    {701, 710, 700},
+                    {601, 610, 600},
+                    {501, 510, 500},
+                    {401, 410, 400},
+                    {301, 310, 300},
+                    {201, 210, 200},
+                    {101, 110, 100},
+                    {51, 55, 50},
+                    {21, 25, 20},
+                    {11, 15, 10},
+                    {5, 10, 5},
+                    {2, 5, 2}
+                };
+                int mapped = 0;
+                for (int i = 0; i < sizeof(pulse_map)/sizeof(pulse_map[0]); i++) {
+                    if (rawPulseCount >= pulse_map[i].min && rawPulseCount < pulse_map[i].max) {
+                        pulseCount += pulse_map[i].value;
+                        mapped = 1;
+                        break;
+                    }
+                }
+                if (!mapped) {
                     pulseCount += rawPulseCount;
                 }
             }
+
             rawPulseCount = 0;
 
             int realPulse = pulseCount;
@@ -313,7 +343,11 @@ void pulse_process_task(void *pvParameters)
                 {
                     char bufferSisa[16];
                     snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
-                    lv_label_set_text(ui_Label11, bufferSisa);
+                    char *sisa_data = malloc(16);
+                    if (sisa_data != NULL) {
+                        strcpy(sisa_data, bufferSisa);
+                        lv_async_call(update_label11_callback, sisa_data);
+                    }
                     if (DEBUG_TRANSACTION_FLOW)
                         printf("Munculkan ke display, tampilkan sisa : %s\n", bufferSisa);
                 }
@@ -321,13 +355,24 @@ void pulse_process_task(void *pvParameters)
                     printf("Pulsa : %ld * Unit valid: %d = %ld\n", valuePulse, validUnits, (long int)(valuePulse * validUnits));
                 if (DEBUG_TRANSACTION_FLOW)
                     printf("Relay pulse ON\n");
-                for (int i = 0; i < (valuePulse * validUnits); i++)
-                {
-                    gpio_set_level(GPIO_OUTPUT_PIN, 1);
-                    vTaskDelay(pdMS_TO_TICKS(valueDuty));
-                    gpio_set_level(GPIO_OUTPUT_PIN, 0);
-                    vTaskDelay(pdMS_TO_TICKS(valueDuration));
+
+                // Kirim perintah ke task relay
+                relay_cmd_t cmd = {
+                    .pulse_count = valuePulse * validUnits,
+                    .valueDuty = valueDuty,
+                    .valueDuration = valueDuration
+                };
+                if (relay_queue != NULL) {
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Sending relay command to queue\n");
+                    xQueueSend(relay_queue, &cmd, portMAX_DELAY);
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Relay command sent to queue successfully\n");
+                } else {
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("ERROR: relay_queue is NULL!\n");
                 }
+
                 if (DEBUG_TRANSACTION_FLOW)
                     printf("Relay pulse OFF\n");
                 if (DEBUG_TRANSACTION_FLOW)
@@ -390,12 +435,23 @@ void pulse_process_task(void *pvParameters)
                     isPreviewShow = 0;
                     pulseCount = 0;
                     rawPulseCount = 0;
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Tidak ada sisa, reset timeout, preview dan pulse\n");
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Reset tampilkan preview ke 0\n");
+                    // Update UI dengan thread-safe way
                     if (ui_Label11 != NULL)
                     {
-                        if (DEBUG_TRANSACTION_FLOW)
-                            printf("Reset tampilkan preview ke 0\n");
-                        lv_label_set_text(ui_Label11, "0");
+                        char *reset_data = malloc(8);
+                        if (reset_data != NULL) {
+                            strcpy(reset_data, "0");
+                            lv_async_call(update_label11_callback, reset_data);
+                        }
                     }
+                    if (DEBUG_TRANSACTION_FLOW)
+                        printf("Calling go_page6 - payment complete\n");
+                    // Set payment type ke cash (1) sebelum pindah ke screen6
+                    PAYMENT_ROUTE.PaymentType = 1;
                     lv_async_call(go_page6, NULL);
                 }
             }
@@ -405,8 +461,13 @@ void pulse_process_task(void *pvParameters)
                     printf("Uang masih kurang, langsung tampilkan total\n");
                 char bufferTotalMoney[16];
                 snprintf(bufferTotalMoney, sizeof(bufferTotalMoney), "%d", totalMoneyPulse);
-                if(ui_Label11 != NULL)
-                    lv_label_set_text(ui_Label11, bufferTotalMoney);
+                if(ui_Label11 != NULL) {
+                    char *total_data = malloc(16);
+                    if (total_data != NULL) {
+                        strcpy(total_data, bufferTotalMoney);
+                        lv_async_call(update_label11_callback, total_data);
+                    }
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -419,18 +480,33 @@ static volatile int64_t last_pulse_time_us = 0;
 
 static void IRAM_ATTR my_gpio_isr_handler(void *arg)
 {
+    if (!is_payment_isr_enabled) return;
     (void)arg;
+    
+    // PERBAIKAN: Cek overflow timer (esp_timer_get_time dapat overflow setelah ~292 tahun)
+    // Tapi untuk safety, tambahkan reset periodis
     int64_t now = esp_timer_get_time();
+    
+    // PERBAIKAN: Handle potential overflow atau negative values
+    if (now < 0 || (last_pulse_time_us > 0 && now < last_pulse_time_us)) {
+        // Reset jika terjadi overflow atau nilai aneh
+        last_pulse_time_us = now;
+        return;
+    }
+    
     if (now - last_pulse_time_us > DEBOUNCE_US)
     {
         rawPulseCount++;
         last_pulse_time_us = now;
+        
+        // PERBAIKAN: Reset timer hanya jika berhasil increment pulse
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        if (pulse_timer != NULL) {
+            xTimerResetFromISR(pulse_timer, &xHigherPriorityTaskWoken);
+            if (xHigherPriorityTaskWoken)
+                portYIELD_FROM_ISR();
+        }
     }
-
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xTimerResetFromISR(pulse_timer, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken)
-        portYIELD_FROM_ISR();
 }
 
 // Fungsi untuk inisialisasi GPIO custom untuk sistem pembayaran
@@ -448,14 +524,21 @@ void gpio_init_custom()
     gpio_config(&io_conf);
 
     // Install service interrupt GPIO dengan flag default
-    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    esp_err_t isr_service_result = gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    if (isr_service_result != ESP_OK && isr_service_result != ESP_ERR_INVALID_STATE) {
+        DEBUG_PRINTLN("ERROR: Failed to install GPIO ISR service: %s", esp_err_to_name(isr_service_result));
+        return;
+    }
 
     // Tambahkan handler interrupt untuk pin GPIO_INPUT_PIN
     // Setiap kali ada perubahan pada pin ini, my_gpio_isr_handler akan dipanggil
-    gpio_isr_handler_add(GPIO_INPUT_PIN, my_gpio_isr_handler, (void *)GPIO_INPUT_PIN);
+    esp_err_t isr_add_result = gpio_isr_handler_add(GPIO_INPUT_PIN, my_gpio_isr_handler, (void *)GPIO_INPUT_PIN);
+    if (isr_add_result != ESP_OK) {
+        DEBUG_PRINTLN("ERROR: Failed to add GPIO ISR handler: %s", esp_err_to_name(isr_add_result));
+        return;
+    }
 
-    // DEBUG: Log bahwa GPIO interrupt sudah diinisialisasi
-    // ESP_LOGI(TAG, "GPIO Interrupt initialized on GPIO%d", (int)GPIO_INPUT_PIN);
+    DEBUG_PRINTLN("GPIO ISR initialized successfully on GPIO%d", (int)GPIO_INPUT_PIN);
 
     /* Konfigurasi Output untuk Relay Coin (Output Koin) */
     gpio_config_t io_conf_out = {
@@ -731,8 +814,24 @@ void app_main(void)
     xTaskCreate(pulse_check_task, "Pulse Check Task", 6144, NULL, 5, NULL);
     xTaskCreate(pulse_process_task, "pulse_process_task", 8192, NULL, 5, NULL);
 
+    // Inisialisasi queue dan task relay
+    relay_queue = xQueueCreate(RELAY_QUEUE_LENGTH, sizeof(relay_cmd_t));
+    if (relay_queue == NULL) {
+        DEBUG_PRINTLN("ERROR: Failed to create relay queue");
+    } else {
+        DEBUG_PRINTLN("Relay queue created successfully");
+        xTaskCreate(relay_task, "relay_task", 2048, NULL, 5, NULL);
+    }
+
     gpio_init_custom();
+    
+    // PERBAIKAN: Buat timer dengan explicit check
     pulse_timer = xTimerCreate("pulse_timer", pdMS_TO_TICKS(PULSE_TIMEOUT_MS), pdFALSE, NULL, pulse_timeout_callback);
+    if (pulse_timer == NULL) {
+        DEBUG_PRINTLN("ERROR: Failed to create pulse_timer");
+    } else {
+        DEBUG_PRINTLN("pulse_timer created successfully");
+    }
 
     // ESP_LOGI(TAG, "Turn off LCD backlight");
     gpio_config_t bk_gpio_config = {
@@ -1073,10 +1172,45 @@ void pulseOutputTask()
     vTaskDelete(NULL);
 }
 
+// Task relay terpisah - menangani output relay tanpa memblokir task utama
+void relay_task(void *pvParameters)
+{
+    relay_cmd_t cmd;
+    while (1) {
+        // Tunggu perintah dari queue
+        if (xQueueReceive(relay_queue, &cmd, portMAX_DELAY) == pdTRUE) {
+            if (DEBUG_TRANSACTION_FLOW)
+                printf("Relay task: Executing %d pulses\n", cmd.pulse_count);
+            
+            // Eksekusi relay pulses
+            for (int i = 0; i < cmd.pulse_count; i++) {
+                gpio_set_level(GPIO_OUTPUT_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(cmd.valueDuty));
+                gpio_set_level(GPIO_OUTPUT_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(cmd.valueDuration));
+            }
+            
+            if (DEBUG_TRANSACTION_FLOW)
+                printf("Relay task: Completed %d pulses\n", cmd.pulse_count);
+        }
+    }
+}
+
 void pulse_check_task(void *pvParameters)
 {
+    TickType_t last_reset_time = xTaskGetTickCount();
+    const TickType_t TIMER_RESET_INTERVAL = pdMS_TO_TICKS(24 * 60 * 60 * 1000); // 24 jam
+    
     while (1)
     {
+        // PERBAIKAN: Reset timer variables setiap 24 jam untuk mencegah overflow
+        TickType_t current_time = xTaskGetTickCount();
+        if ((current_time - last_reset_time) >= TIMER_RESET_INTERVAL) {
+            last_pulse_time_us = esp_timer_get_time(); // Reset base time
+            last_reset_time = current_time;
+            DEBUG_PRINTLN("24h timer reset performed for ISR stability");
+        }
+        
         int32_t valueExpiredTimeBill;
         if (load_nvs_i32("storage", "ExpiredTimeBill", &valueExpiredTimeBill) != ESP_OK)
             valueExpiredTimeBill = 1;
@@ -1112,6 +1246,8 @@ void pulse_check_task(void *pvParameters)
                 //         printf("Tampilkan counting..\n");
                 //     lv_label_set_text(ui_Label11, "Membaca...");
                 // }
+                
+                // kehalaman preview ulang dari bill acceptor
                 lv_async_call(go_page9, NULL);
             }
             if (timeoutInSecond > valueExpiredTimeBill)
@@ -1138,7 +1274,11 @@ void pulse_check_task(void *pvParameters)
                 {
                     char bufferSisa[16];
                     snprintf(bufferSisa, sizeof(bufferSisa), "%d", sisa);
-                    lv_label_set_text(ui_Label11, bufferSisa);
+                    char *sisa_data = malloc(16);
+                    if (sisa_data != NULL) {
+                        strcpy(sisa_data, bufferSisa);
+                        lv_async_call(update_label11_callback, sisa_data);
+                    }
                 }
                 // Reset all if time is up
                 pulseCount = 0;
@@ -1149,7 +1289,11 @@ void pulse_check_task(void *pvParameters)
                 {
                     if (DEBUG_TRANSACTION_FLOW)
                         printf("Reset tampilkan preview ke 0\n");
-                    lv_label_set_text(ui_Label11, "0");
+                    char *reset_data = malloc(8);
+                    if (reset_data != NULL) {
+                        strcpy(reset_data, "0");
+                        lv_async_call(update_label11_callback, reset_data);
+                    }
                 }
                 screen4_set_message("Pembayaran gagal");
                 lv_async_call(go_page4, NULL);
@@ -1222,6 +1366,22 @@ void update_remain_time_label(void *data)
         }
         // Bebaskan memori yang dialokasikan di pulse_check_task
         free(time_str);
+    }
+}
+
+void update_label11_callback(void *data)
+{
+    char *text_str = (char *)data;
+    if (text_str != NULL)
+    {
+        if (ui_Label11 != NULL)
+        {
+            // Fungsi ini akan dipanggil dari LVGL task yang sudah memiliki proper locking
+            lv_label_set_text(ui_Label11, text_str);
+            printf("DEBUG: ui_Label11 updated to: %s\n", text_str);
+        }
+        // Bebaskan memori yang dialokasikan
+        free(text_str);
     }
 }
 

@@ -1,4 +1,5 @@
 #include "ui.h"
+#include <stdio.h>
 
 void go_page1(void *data) {
     lv_lock();
@@ -31,9 +32,17 @@ void go_page5(void *data) {
 }
 
 void go_page6(void *data) {
+    printf("DEBUG: go_page6 called\n");
     lv_lock();
-    lv_scr_load(ui_Screen6);
+    if (ui_Screen6 != NULL) {
+        printf("DEBUG: ui_Screen6 is valid, loading screen\n");
+        lv_scr_load(ui_Screen6);
+        printf("DEBUG: Screen6 loaded successfully\n");
+    } else {
+        printf("ERROR: ui_Screen6 is NULL!\n");
+    }
     lv_unlock();
+    printf("DEBUG: go_page6 completed\n");
 }
 
 void go_page7(void *data) {

@@ -14,7 +14,7 @@
 #include "esp_log.h"
 #include "string.h"
 #include "usr_k2_lan.h"
-#include "../safe_page.h"
+#include "safe_page.h"
 #include "my_global_lib.h"
 #include "my_wifi.h"
 #include "nvs_helper.h"
@@ -397,7 +397,10 @@ void button_cb_call_midtrans(lv_event_t *e)
     DEBUG_PRINTLN("=== PAYMENT BUTTON CLICKED ===");
     DEBUG_PRINTLN("payment_task_running: %s", payment_task_running ? "true" : "false");
     DEBUG_PRINTLN("active_payment_tasks: %d", active_payment_tasks);
-    
+
+    // disable bill acceptor
+    is_payment_isr_enabled = false;
+
     // CRITICAL: Prevent any clicks if task is already running or button is disabled
     if (payment_task_running || active_payment_tasks > 0) {
         DEBUG_PRINTLN("Payment task already running, ignoring click");

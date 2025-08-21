@@ -4,13 +4,57 @@
 // Project name: SquareLine_Project
 
 #include "../ui.h"
+#include "../safe_page.h"
 #include "esp_log.h"
 #include <stdio.h>
+#include <string.h>
 #include "my_global_lib.h"
 
 //static const char *TAG = "ui_Screen9";
 
+// Timer untuk monitoring ui_Label11
+static lv_timer_t *label11_monitor_timer = NULL;
+
 void screen9_event_handler(lv_event_t *e);
+static void label11_monitor_callback(lv_timer_t *timer);
+
+// Timer callback untuk memeriksa ui_Label11
+static void label11_monitor_callback(lv_timer_t *timer)
+{
+    if (ui_Label11 != NULL) {
+        const char *text = lv_label_get_text(ui_Label11);
+        
+        // Periksa jika text kosong, null, atau hanya berisi whitespace
+        if (text == NULL || strlen(text) == 0 || 
+            (strlen(text) == 1 && text[0] == ' ') ||
+            strcmp(text, "") == 0) {
+            
+            DEBUG_PRINTLN("ui_Label11 is empty, forcing go to page6");
+            
+            // Stop timer sebelum pindah halaman
+            if (label11_monitor_timer != NULL) {
+                lv_timer_delete(label11_monitor_timer);
+                label11_monitor_timer = NULL;
+            }
+            
+            // Paksa pindah ke halaman 6
+            lv_async_call(go_page6, NULL);
+        } else {
+            DEBUG_PRINTLN("ui_Label11 content: '%s'", text);
+        }
+    } else {
+        DEBUG_PRINTLN("ui_Label11 is NULL");
+        
+        // Stop timer jika ui_Label11 adalah NULL
+        if (label11_monitor_timer != NULL) {
+            lv_timer_delete(label11_monitor_timer);
+            label11_monitor_timer = NULL;
+        }
+        
+        // Paksa pindah ke halaman 6
+        lv_async_call(go_page6, NULL);
+    }
+}
 
 void screen9_event_handler(lv_event_t *e)
 {
@@ -20,6 +64,23 @@ void screen9_event_handler(lv_event_t *e)
     {
         // Ini dipanggil setelah screen tampil
         DEBUG_PRINTLN("Screen9 loaded!");
+        
+        // Mulai timer untuk memeriksa ui_Label11 setiap 1 detik
+        if (label11_monitor_timer == NULL) {
+            label11_monitor_timer = lv_timer_create(label11_monitor_callback, 1000, NULL);
+            DEBUG_PRINTLN("Label11 monitor timer started");
+        }
+    }
+    else if (code == LV_EVENT_SCREEN_UNLOADED)
+    {
+        // Screen akan di-unload, hentikan timer
+        DEBUG_PRINTLN("Screen9 unloaded!");
+        
+        if (label11_monitor_timer != NULL) {
+            lv_timer_delete(label11_monitor_timer);
+            label11_monitor_timer = NULL;
+            DEBUG_PRINTLN("Label11 monitor timer stopped");
+        }
     }
 }
 

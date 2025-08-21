@@ -24,8 +24,13 @@ static void change_to_screen2(lv_timer_t * timer);
 // Timer callback untuk pindah ke screen8
 static void change_to_screen2(lv_timer_t * timer)
 {
+    // Reset ISR enable
+    is_payment_isr_enabled = true; // enable isr bill acceptor
+
     DEBUG_PRINTLN("Pindah ke screen 2");
-    // Pindahkan screen ke Screen8
+    // Reset payment type setelah QRIS payment selesai
+    PAYMENT_ROUTE.PaymentType = 0;
+    // Pindahkan screen ke Screen2
     lv_async_call(go_page2, NULL);
 }
 
@@ -75,18 +80,42 @@ void screen6_event_handler(lv_event_t *e)
 
             // (opsional) Setelah itu mati terus
             gpio_set_level(GPIO_OUTPUT_PIN, 0);
+            
+            // buat efek sukses untuk QRIS
+            // Buat timer 2000ms (2 detik), sekali jalan (oneshot)
+            lv_timer_t *timer = lv_timer_create(change_to_screen2, 2000, NULL);
+            lv_timer_set_repeat_count(timer, 1); // supaya timer jalan sekali saja
+        } else {
+            // (opsional) Setelah itu mati terus
+            gpio_set_level(GPIO_OUTPUT_PIN, 0);
+            
+            DEBUG_PRINTLN("Cash payment success - showing screen indefinitely");
+            lv_timer_t *timer = lv_timer_create(change_to_screen2, 2000, NULL);
+            lv_timer_set_repeat_count(timer, 1); // supaya timer jalan sekali saja
+            // Untuk pembayaran cash, tidak perlu timer otomatis pindah
+            // User bisa tap screen untuk kembali ke home
         }
-         /* End QRIS Executing contact */
-
-        // buat efek sukses
-        // Buat timer 2000ms (2 detik), sekali jalan (oneshot)
-        lv_timer_t *timer = lv_timer_create(change_to_screen2, 2000, NULL);
-        lv_timer_set_repeat_count(timer, 1); // supaya timer jalan sekali saja
+         /* End QRIS/Cash payment handling */
 
         // ini digunakan untuk trigger output relay
         //xTaskCreate(request_midtrans_check_task, "request_midtrans_check_task", 4096, NULL, 5, NULL);
 
-        PAYMENT_ROUTE.PaymentType = 0;
+        // Reset payment type hanya setelah semua handling selesai
+        // Tapi simpan value sementara untuk click handler
+        if (PAYMENT_ROUTE.PaymentType != 2) {
+            // Untuk cash payment, simpan indicator bahwa ini cash payment
+            // Kita gunakan nilai 1 untuk menandakan cash payment yang sudah selesai
+            // Reset akan dilakukan setelah user tap atau setelah timer QRIS
+        } else {
+            // Untuk QRIS, reset akan dilakukan di timer callback
+        }
+    }
+    else if (code == LV_EVENT_CLICKED)
+    {
+        // Jika user tap screen, kembali ke home dan reset payment type
+        DEBUG_PRINTLN("User tapped screen6, returning to home");
+        PAYMENT_ROUTE.PaymentType = 0; // Reset payment type
+        lv_async_call(go_page2, NULL);
     }
 }
 
